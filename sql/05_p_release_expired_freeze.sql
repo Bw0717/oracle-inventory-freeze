@@ -11,183 +11,212 @@
 --   手動（UI）  ：任一廠區失敗 → 整批 ROLLBACK 並回傳錯誤碼
 -- =============================================================
 CREATE OR REPLACE PROCEDURE P_RELEASE_EXPIRED_FREEZE (
-    IN_MODE         IN  VARCHAR2 DEFAULT NULL,   -- '自動' / '手動'，NULL 視為 '自動'
-    IN_FACTORY      IN  VARCHAR2 DEFAULT NULL,   -- NULL = 全部廠區
-    IN_DEPT         IN  VARCHAR2 DEFAULT NULL,   -- NULL = 全部部門
+    IN_ADACCOUNT    IN  VARCHAR2 DEFAULT NULL,
+    IN_V_MODE         IN  VARCHAR2 DEFAULT NULL,
+    IN_FACTORY      IN  VARCHAR2 DEFAULT NULL,
+    IN_DEPT         IN  VARCHAR2 DEFAULT NULL,
     OUT_MSG_CODE    OUT VARCHAR2,
     OUT_MSG_RESULT  OUT VARCHAR2
 )
 IS
     PRAGMA AUTONOMOUS_TRANSACTION;
 
+    v_mode          VARCHAR2(20) := IN_V_MODE;
+    v_current_db    VARCHAR2(10);
+    v_finish_date   DATE;
+    v_freeze_mode   VARCHAR2(20);
+    v_sql           VARCHAR2(2000);
+
     TYPE t_db_rec IS RECORD (
-        factory_name  VARCHAR2(100),
-        db_link       VARCHAR2(128)
+        factory_name  VARCHAR2(50),
+        db_link       VARCHAR2(10)
     );
     TYPE t_db_tab IS TABLE OF t_db_rec;
+    v_db_list       t_db_tab;
 
-    v_mode      VARCHAR2(20) := NVL(IN_MODE, '自動');
-    v_db_list   t_db_tab;
-    v_company   VARCHAR2(100);
-    v_db        VARCHAR2(128);
-    v_sql       VARCHAR2(4000);
-    v_updated   PLS_INTEGER := 0;
-    v_skipped   PLS_INTEGER := 0;
-    v_code      NUMBER;
-    v_errm      VARCHAR2(4000);
-    v_stack     VARCHAR2(4000);
-
-    PROCEDURE notify(p_msg IN VARCHAR2) IS
-    BEGIN
-        P_SEND_TEAMS_MSG(PKG_INV_FREEZE.c_teams_group_id, p_msg);
-    END notify;
-
+    c_group_id      CONSTANT VARCHAR2(40) := '75C4BE22E6BF45D39803E9BD6B430E71';
 BEGIN
-    -- UI 未選擇
+    --UI未選擇處理
     IF IN_FACTORY = '--xxx--' THEN
-        OUT_MSG_CODE   := '18';
+        OUT_MSG_CODE   := '17';
         OUT_MSG_RESULT := '廠區並未選擇';
         RETURN;
     END IF;
 
     IF IN_DEPT = '--xxx--' THEN
-        OUT_MSG_CODE   := '19';
+        OUT_MSG_CODE   := '18';
         OUT_MSG_RESULT := '部門並未選擇';
         RETURN;
     END IF;
 
-    DELETE FROM GTT_FREEZE_LOT;   -- 避免暫存資料殘留
+    --傳進來的值如果是自動表示是手動觸發，但設定是自動
+    IF v_mode = '自動' THEN
+        OUT_MSG_CODE   := '19';
+        OUT_MSG_RESULT := '目前設定為自動，不允許手動操作';
+        RETURN;
+    ELSIF v_mode = '查無設定' THEN
+        OUT_MSG_CODE   := '19';
+        OUT_MSG_RESULT := '客製化分類設定，未設定此部門';
+        RETURN;      
+    END IF;
 
-    -- 找出有凍結資料的廠區及其 DB LINK（每個廠區只處理一次）
-    SELECT DISTINCT wt.company, ex.remark03
+    --JOB觸發為NULL/手動觸發為手動
+    IF v_mode IS NULL THEN
+        v_mode := '自動';
+    END IF;
+
+    DELETE FROM GTT_FREEZE_LOT;   -- 避免TEMP資料殘留
+
+    --查連到哪個DB LINK
+    SELECT DISTINCT wt.company AS factory_name, ex.remark03 AS db_link
     BULK COLLECT INTO v_db_list
-    FROM   ztpp_worktime wt,
-           (SELECT remark02, remark03
-              FROM extenditem_mapping
-             WHERE class = 'FACTORY_MAP_DBLINK') ex
+    FROM   (SELECT * FROM extenditem_mapping
+            WHERE  class = 'FACTORY_MAP_DBLINK') ex,
+           ztpp_worktime wt
     WHERE  wt.deliver_sap = 'Z'
     AND    wt.company     = ex.remark02(+)
-    AND    (IN_FACTORY IS NULL OR wt.company = IN_FACTORY);
+    AND    (wt.company = IN_FACTORY OR IN_FACTORY IS NULL);
 
-    -- 逐廠區從遠端撈出可解凍的 LOT，放入 GTT
+    --沒有凍結中的報工資料就結束
+    IF v_mode = '手動' THEN
+      IF v_db_list.COUNT = 0 THEN
+          ROLLBACK;
+          OUT_MSG_CODE   := '23';
+          OUT_MSG_RESULT := '目前沒有凍結中的報工資料';
+          RETURN;
+      END IF;
+    END IF;  
+    --把DB LINK處理的資料全部丟到DEC的TEMP
     FOR i IN 1 .. v_db_list.COUNT LOOP
-        v_company := v_db_list(i).factory_name;
-        v_db      := v_db_list(i).db_link;
+        v_current_db := v_db_list(i).db_link;
 
-        IF v_db IS NULL THEN
+        IF v_current_db IS NULL THEN
             IF v_mode = '手動' THEN
                 ROLLBACK;
                 OUT_MSG_CODE   := '21';
-                OUT_MSG_RESULT := 'EXTENDITEM_MAPPING 未設定廠區 ' || v_company || ' 的 DB LINK';
+                OUT_MSG_RESULT := 'DEC.EXTENDITEM_MAPPING廠區未設定：' || v_db_list(i).factory_name;
                 RETURN;
             END IF;
-            notify('P_RELEASE_EXPIRED_FREEZE：COMPANY=' || v_company ||
-                   ' 找不到對應 DB LINK，請確認 EXTENDITEM_MAPPING 設定');
-            v_skipped := v_skipped + 1;
+
+            P_SEND_TEAMS_MSG(
+                p_group_id => c_group_id,
+                p_msg      => '執行P_RELEASE_EXPIRED_FREEZE@DEC，發生COMPANY:' || v_db_list(i).factory_name ||
+                              '找不到對應DB LINK 請確認'
+            );
             CONTINUE;
         END IF;
 
         BEGIN
-            v_db := PKG_INV_FREEZE.check_dblink(v_db);
+            --手動執行：檢查解凍模式與盤點結束時間
+            IF v_mode = '手動' AND IN_DEPT IS NOT NULL THEN
+                v_sql :=
+                    'SELECT TO_DATE(remark04, ''FXYYYYMMDDHH24MISS''), remark06
+                     FROM   bs_extenditem_mapping' || v_current_db || '
+                     WHERE  class    = ''INVENTORY_FREEZE''
+                     AND    remark01 = :1';
 
+                BEGIN
+                    EXECUTE IMMEDIATE v_sql INTO v_finish_date, v_freeze_mode USING IN_DEPT;
+                EXCEPTION
+                    WHEN NO_DATA_FOUND THEN
+                        ROLLBACK;
+                        OUT_MSG_CODE   := '24';
+                        OUT_MSG_RESULT := '查無部門 ' || IN_DEPT || ' 的盤點凍結設定';
+                        RETURN;
+                END;
+
+                IF v_freeze_mode IS NULL OR v_freeze_mode != v_mode THEN
+                    ROLLBACK;
+                    OUT_MSG_CODE   := '25';
+                    OUT_MSG_RESULT := '部門 ' || IN_DEPT || ' 的解凍設定為[' || NVL(v_freeze_mode, '未設定') ||
+                                      ']，與目前執行模式[' || v_mode || ']不符';
+                    RETURN;
+                ELSIF v_finish_date IS NULL THEN
+                    ROLLBACK;
+                    OUT_MSG_CODE   := '24';
+                    OUT_MSG_RESULT := '部門 ' || IN_DEPT || ' 未設定盤點結束時間';
+                    RETURN;
+                ELSIF SYSDATE < v_finish_date THEN
+                    ROLLBACK;
+                    OUT_MSG_CODE   := '22';
+                    OUT_MSG_RESULT := '尚未到達盤點結束時間，盤點結束時間為:' ||
+                                      TO_CHAR(v_finish_date, 'YYYY/MM/DD HH24:MI:SS');
+                    RETURN;
+                END IF;
+            END IF;
+
+            --預存EX,LOT符合的資料到TEMP，避免過多DBLINK
             v_sql :=
                 'INSERT INTO GTT_FREEZE_LOT (sap_wo, lot, dept_id, factory_name)
-                 SELECT DISTINCT lot.sap_wo, lot.lot, lot.dept_id, bf.factory_name
-                   FROM wip_lot'     || v_db || ' lot,
-                        bs_factory'  || v_db || ' bf
-                  WHERE lot.factory_id  = bf.factory_id
-                    AND bf.factory_name = :1
-                    AND (:2 IS NULL OR lot.dept_id = :3)
-                    -- 有已到期、且模式符合的凍結設定
-                    AND EXISTS (
-                        SELECT 1
-                          FROM (SELECT remark01 AS dept_id,
-                                       remark06 AS release_mode,
-                                       CASE WHEN class = ''INVENTORY_FREEZE''
-                                            THEN TO_DATE(remark04, ''FXYYYYMMDDHH24MISS'') END AS end_dt
-                                  FROM bs_extenditem_mapping' || v_db || '
-                                 WHERE class = ''INVENTORY_FREEZE'') ex
-                         WHERE ex.dept_id      = lot.dept_id
-                           AND ex.release_mode = :4
-                           AND SYSDATE > ex.end_dt)
-                    -- 且沒有仍在生效中的凍結設定
-                    AND NOT EXISTS (
-                        SELECT 1
-                          FROM (SELECT remark01 AS dept_id,
-                                       CASE WHEN class = ''INVENTORY_FREEZE'' AND remark02 = ''Y''
-                                            THEN TO_DATE(remark03, ''FXYYYYMMDDHH24MISS'') END AS start_dt,
-                                       CASE WHEN class = ''INVENTORY_FREEZE'' AND remark02 = ''Y''
-                                            THEN TO_DATE(remark04, ''FXYYYYMMDDHH24MISS'') END AS end_dt
-                                  FROM bs_extenditem_mapping' || v_db || '
-                                 WHERE class    = ''INVENTORY_FREEZE''
-                                   AND remark02 = ''Y'') ex2
-                         WHERE ex2.dept_id = lot.dept_id
-                           AND SYSDATE BETWEEN ex2.start_dt AND ex2.end_dt)';
+                 SELECT lot.sap_wo, lot.lot, lot.dept_id, bf.factory_name
+                 FROM   wip_lot' || v_current_db || ' lot,
+                        bs_extenditem_mapping' || v_current_db || ' ex,
+                        bs_factory' || v_current_db || ' bf
+                 WHERE  lot.factory_id = bf.factory_id
+                 AND    lot.dept_id    = ex.remark01
+                 AND    ex.class       = ''INVENTORY_FREEZE''
+                 AND    ex.remark06    = :1
+                 AND    SYSDATE > TO_DATE(ex.remark04, ''FXYYYYMMDDHH24MISS'')';
 
-            EXECUTE IMMEDIATE v_sql USING v_company, IN_DEPT, IN_DEPT, v_mode;
+            IF IN_DEPT IS NOT NULL THEN
+                v_sql := v_sql || ' AND ex.remark01 = :2';
+                EXECUTE IMMEDIATE v_sql USING v_mode, IN_DEPT;
+            ELSE
+                EXECUTE IMMEDIATE v_sql USING v_mode;
+            END IF;
+
         EXCEPTION
             WHEN OTHERS THEN
-                v_code := SQLCODE;
-                v_errm := SQLERRM;
-
-                IF v_mode = '手動' THEN
-                    IF PKG_INV_FREEZE.is_date_error(v_code) THEN
-                        ROLLBACK;
-                        OUT_MSG_CODE   := '20';
-                        OUT_MSG_RESULT := SUBSTR(
-                            '資料格式錯誤：' || v_db ||
-                            ' 系統的 [客製化分類設定] 開始/結束時間格式不正確，請確認設定。錯誤訊息: ' || v_errm,
-                            1, 4000);
-                        RETURN;
-                    END IF;
-                    RAISE;   -- 交給最外層處理（回傳 99）
+                -- 如果客製化分類時間格式設定錯誤
+                IF SQLCODE IN (-1858, -1830, -1843, -1847, -1841, -1861, -1862) THEN
+                    ROLLBACK;   -- 清除 GTT 的資料
+                    OUT_MSG_CODE   := '20';
+                    OUT_MSG_RESULT := SUBSTR(
+                        '資料格式錯誤：' || v_current_db ||
+                        ' 系統的[客製化分類設定].[結束時間] 格式不正確，請確認設定。錯誤訊息: ' || SQLERRM,
+                        1, 4000
+                    );
+                    RETURN;
+                ELSE
+                    RAISE;   -- 不是日期格式問題，往外拋給最外層的 EXCEPTION 處理
                 END IF;
-
-                -- 自動模式：通知後略過此廠區
-                notify(SUBSTR(
-                    'P_RELEASE_EXPIRED_FREEZE：COMPANY=' || v_company || '（' || v_db || '）' ||
-                    CASE WHEN PKG_INV_FREEZE.is_date_error(v_code)
-                         THEN ' [客製化分類設定] 時間格式不正確'
-                         ELSE ' 處理失敗'
-                    END || '，已略過。錯誤訊息: ' || v_errm,
-                    1, 4000));
-                v_skipped := v_skipped + 1;
         END;
     END LOOP;
 
-    -- 解除凍結
+    -- 解除凍結UPDATE
     UPDATE ztpp_worktime wt
     SET    deliver_sap = 'N'
     WHERE  deliver_sap = 'Z'
     AND    EXISTS (
         SELECT 1
-        FROM   GTT_FREEZE_LOT g
-        WHERE  wt.runcard    = g.lot
-        AND    wt.work_order = g.sap_wo
-        AND    wt.company    = g.factory_name
+        FROM   GTT_FREEZE_LOT sfc
+        WHERE  wt.runcard    = sfc.lot
+        AND    wt.work_order = sfc.sap_wo
+        AND    wt.company    = sfc.factory_name
+        AND    (IN_DEPT IS NULL OR sfc.dept_id = IN_DEPT)
     );
-    v_updated := SQL%ROWCOUNT;
 
     COMMIT;
 
     OUT_MSG_CODE   := '00';
-    OUT_MSG_RESULT := '解除凍結完成，共 ' || v_updated || ' 筆' ||
-                      CASE WHEN v_skipped > 0
-                           THEN '（' || v_skipped || ' 個廠區處理失敗已略過，詳見 Teams 通知）'
-                      END;
+    OUT_MSG_RESULT := '解除凍結完成';
 
 EXCEPTION
     WHEN OTHERS THEN
-        -- 先保存錯誤資訊，避免後續呼叫覆蓋
-        v_code  := SQLCODE;
-        v_errm  := SQLERRM;
-        v_stack := SUBSTR(DBMS_UTILITY.FORMAT_ERROR_BACKTRACE || DBMS_UTILITY.FORMAT_ERROR_STACK, 1, 3000);
-
+        --預期外錯誤就發TEAMS
         ROLLBACK;
-        notify(SUBSTR('P_RELEASE_EXPIRED_FREEZE 執行失敗，COMPANY=' || v_company ||
-                      '，DB LINK=' || v_db || '，錯誤訊息: ' || v_errm, 1, 4000));
-
-        OUT_MSG_CODE   := '99';
-        OUT_MSG_RESULT := SUBSTR('執行例外錯誤: ' || v_stack || ' | ' || v_code || ' -- ' || v_errm, 1, 4000);
+        P_SEND_TEAMS_MSG(
+            p_group_id => c_group_id,
+            p_msg      => 'P_RELEASE_EXPIRED_FREEZE@DEC，執行者:' || NVL(IN_ADACCOUNT, 'JOB') ||
+                          '，' || NVL(v_current_db, '(未知)') || ' Z轉換N發生錯誤: ' || SQLERRM
+        );
+        IF v_mode = '手動' THEN
+          OUT_MSG_CODE   := '99';
+          OUT_MSG_RESULT := SUBSTR(
+              '執行例外錯誤: ' || DBMS_UTILITY.FORMAT_ERROR_BACKTRACE ||
+              DBMS_UTILITY.FORMAT_ERROR_STACK || ' & ' || SQLCODE || ' -- ' || SQLERRM,
+              1, 4000
+          );
+        END IF;
 END P_RELEASE_EXPIRED_FREEZE;
 /
